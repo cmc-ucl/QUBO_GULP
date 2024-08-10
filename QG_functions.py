@@ -34,6 +34,7 @@ def max_lattice_translation(lattice_vectors, R_max):
     return max_translation
 
 def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G_max=None, 
+
                          max_shift = None,charge=None,w=1,print_info=False, triu=False):
     """
     Parameters:
@@ -180,3 +181,21 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
         print(f"Total (eV): {Real_E + Reci_E + Reci_self:.16f}")
     
     return Ewald_full
+
+
+def calculate_potential_energy(ewald_matrix, charges):
+    """
+    Calculate the potential energy of the system given the Ewald summation matrix and charges.
+
+    Parameters:
+    ewald_matrix (ndarray): Ewald summation matrix (NxN).
+    charges (ndarray): Charges of the particles (N).
+
+    Returns:
+    float: Total potential energy of the system.
+    """
+    
+    charges = np.array(charges)
+    
+    
+    return  charges[:, np.newaxis] * charges[np.newaxis, :] * ewald_matrix
