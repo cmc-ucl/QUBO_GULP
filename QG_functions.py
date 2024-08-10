@@ -183,7 +183,8 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
     return Ewald_full
 
 
-def calculate_potential_energy(ewald_matrix, charges):
+def calculate_ewald_matrix_charges(ewald_matrix, charges):
+
     """
     Calculate the potential energy of the system given the Ewald summation matrix and charges.
 
@@ -197,5 +198,85 @@ def calculate_potential_energy(ewald_matrix, charges):
     
     charges = np.array(charges)
     
-    
     return  charges[:, np.newaxis] * charges[np.newaxis, :] * ewald_matrix
+
+
+def buckingham_potential(param, r):
+    """
+    Calculate the Buckingham potential for a given distance.
+
+    Parameters:
+    A (float): Constant A in the Buckingham potential equation.
+    Rho (float): Constant Rho in the Buckingham potential equation.
+    C (float): Constant C in the Buckingham potential equation.
+    r (float): Distance between two atoms.
+
+    Returns:
+    float: Potential energy at distance r.
+    """
+    A = param[0]
+    Rho = param[1]
+    C = param[2]
+    
+    V = A * np.exp(-r / Rho) - C / r**6
+    return V
+
+
+def compute_buckingham_matrix(structure, buckingham_dict, R_max, max_shift=None):
+    """
+    Compute the Ewald summation matrix for a system of particles.
+
+    Parameters:
+    positions (ndarray): Relative positions of particles (Nx3).
+    lattice_vectors (ndarray): Lattice vectors of the unit cell (3x3).
+
+    """
+    frac_coords = structure.frac_coords
+    lattice_vectors = structure.lattice.matrix
+    sites = structure.sites
+    
+    TO_EV = 14.39964390675221758120
+    
+    t0 = time.time()
+    
+    N = structure.num_sites
+    V = np.linalg.det(lattice_vectors)
+    
+    cart_coords = frac_coords @ lattice_vectors
+    
+    if max_shift == None:
+        max_real = max_lattice_translation(lattice_vectors, R_max)
+        nx = max_real[0]
+        ny = max_real[1]
+        nz = max_real[2]
+    else:
+        ny = nz = nx = max_shift
+    #print(f'Max vectors = {nx},{ny},{nz}')
+    buckingham_matrix = np.zeros((N,N))
+    
+    for i in tqdm(range(N), desc="Buckingham matrix"):
+        for j in range(i+1,N):
+            
+            sites_label = f'{sites[i].specie}-{sites[j].specie}'
+            if sites_label in buckingham_dict:
+                dr_init = cart_coords[i]-cart_coords[j]
+
+                for rnx in range(-nx, nx + 1):
+                    for rny in range(-ny, ny + 1):
+                        for rnz in range(-nz, nz + 1):
+
+                            lattice_translation = np.array([rnx, rny, rnz])
+
+                            shift = rnx*lattice_vectors[0]+rny*lattice_vectors[1]+rnz*lattice_vectors[2]
+                            dr = dr_init + shift
+                            if np.linalg.norm(dr) < R_max:
+                                dr = dr_init + shift
+                                                                        np.linalg.norm(dr)))
+                                buckingham_matrix[i][j] += buckingham_potential(buckingham_dict[sites_label],
+                                                                         np.linalg.norm(dr))
+    return buckingham_matrix
+
+
+def build_qubo_from_Ewald_IP(Ewald_matrix,IP_matrix):
+    
+    return Ewald_matrix + IP_matrix
