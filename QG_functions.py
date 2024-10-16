@@ -1,10 +1,11 @@
 import numpy as np
 from tqdm import tqdm
 import math
+from numba import njit, prange
 
 import time
 
-def max_lattice_translation(lattice_vectors, R_max):
+def max_lattice_translation_old(lattice_vectors, R_max):
     # Calculate the maximum rnx, rny, and rnz
     norm_0 = np.linalg.norm(lattice_vectors[0])
     norm_1 = np.linalg.norm(lattice_vectors[1])
@@ -35,7 +36,7 @@ def max_lattice_translation(lattice_vectors, R_max):
 
 def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G_max=None, 
 
-                         max_shift = None,charge=None,w=1,print_info=False, triu=False):
+                         max_shift = None,w=1,print_info=False, triu=False):
     """
     Parameters:
     frac_coords (ndarray): Relative positions of particles (Nx3).
@@ -43,7 +44,6 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
     sigma (float): Ewald parameter controlling the split between real and reciprocal sums. If None, it's calculated.
     max_shift (int): Depth of the real and reciprocal space summation.
     reciprocal_depth (int): Depth of the reciprocal space summation.
-    charge (ndarray): charges of the system (Nx1).
 
     Returns:
     ndarray: Ewald summation matrix (NxN).
@@ -85,8 +85,8 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
     
     
     if max_shift == None:
-        real_space_max = max_lattice_translation(lattice_vectors,R_max)
-        reci_space_max = max_lattice_translation(reciprocal_vectors,G_max)
+        real_space_max = max_lattice_translation_old(lattice_vectors,R_max)
+        reci_space_max = max_lattice_translation_old(reciprocal_vectors,G_max)
     
         real_reci_space_max = np.maximum(real_space_max,reci_space_max)
         
@@ -113,7 +113,6 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
         print(f'w={w}')
         
         print(f'alpha= {alpha}, sigma={Sigma},R_max = {R_max}, G_max = {G_max}')
-        print(f'Charge = {charge}')
         
         #print('Cart coords\n',cart_coords)
         print(f'Max vectors = {nx},{ny},{nz}')
@@ -138,7 +137,6 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
                                
                                 if i != j:
                                     Ewald_real[i,j] += 0.5 / norm(dr) * math.erfc(norm(dr)/Sigma) * TO_EV
-                                    Real_E          += 0.5 * charge[i] * charge[j] / norm(dr) * math.erfc(norm(dr)/Sigma) * TO_EV
                                 else:
                                     Ewald_recip_self[i,j] += -1 / Sigma / math.sqrt(np.pi) * TO_EV
                                     
@@ -146,7 +144,7 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
                             else:
 
                                 Ewald_real[i,j] += 0.5 / norm(dr) * math.erfc(norm(dr)/Sigma) * TO_EV
-                                Real_E          += 0.5 * charge[i] * charge[j] / norm(dr) * math.erfc(norm(dr)/Sigma) * TO_EV
+                                
                                 
                             # Reciprocal sum
 
@@ -156,7 +154,6 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
                             if np.any(lattice_translation != 0):
                                 g_2 = np.dot(gr, gr)
 
-                                Reci_E += TO_EV * (2 * np.pi / V) * (charge[i] * charge[j]) * math.exp(-0.25 * Sigma * Sigma * g_2) / g_2 * math.cos(np.dot(gr, dr))
                                 Ewald_recip[i,j] +=  TO_EV * (2 * np.pi / V) * math.exp(-0.25 * Sigma * Sigma * g_2) / g_2 * math.cos(np.dot(gr, dr))
 
     Ewald_full = Ewald_real+Ewald_recip+Ewald_recip_self
@@ -170,7 +167,7 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
         np.fill_diagonal(Ewald_tmp,Ewald_full.diagonal())
         Ewald_full = np.copy(Ewald_tmp)
     
-    Reci_self = sum(-(charge[i]**2) / Sigma / math.sqrt(np.pi) * TO_EV for i in range(N))
+    
     
     if print_info == True:
         
@@ -180,8 +177,8 @@ def compute_ewald_matrix(frac_coords, lattice_vectors, sigma=None, R_max=None, G
         print(f"Reciprocal (eV): {Reci_self + Reci_E:.16f}")
         print(f"Total (eV): {Real_E + Reci_E + Reci_self:.16f}")
     
-    return Ewald_full
 
+    return Ewald_full
 
 def calculate_ewald_matrix_charges(ewald_matrix, charges):
 
@@ -271,7 +268,6 @@ def compute_buckingham_matrix(structure, buckingham_dict, R_max, max_shift=None)
                             dr = dr_init + shift
                             if np.linalg.norm(dr) < R_max:
                                 dr = dr_init + shift
-                                                                        np.linalg.norm(dr)))
                                 buckingham_matrix[i][j] += buckingham_potential(buckingham_dict[sites_label],
                                                                          np.linalg.norm(dr))
     return buckingham_matrix
@@ -280,3 +276,183 @@ def compute_buckingham_matrix(structure, buckingham_dict, R_max, max_shift=None)
 def build_qubo_from_Ewald_IP(Ewald_matrix,IP_matrix):
     
     return Ewald_matrix + IP_matrix
+
+### NUMBA FUNCTIONS
+
+# Keep this function outside Numba
+def max_lattice_translation(lattice_vectors, R_max):
+    norm_0 = np.linalg.norm(lattice_vectors[0])
+    norm_1 = np.linalg.norm(lattice_vectors[1])
+    norm_2 = np.linalg.norm(lattice_vectors[2])
+
+    max_rnx = int(R_max / norm_0)
+    max_rny = int(R_max / norm_1)
+    max_rnz = int(R_max / norm_2)
+
+    return np.array([max_rnx, max_rny, max_rnz])
+
+
+# Use Numba to optimize the main function
+@njit(parallel=True)
+def compute_ewald_matrix_numba(frac_coords, cart_coords, reciprocal_vectors, sigma, R_max, 
+                               G_max, nx, ny, nz, TO_EV, Sigma, alpha, V, N):
+    
+    Ewald_real = np.zeros((N, N))
+    Ewald_recip = np.zeros((N, N))
+    Ewald_recip_self = np.zeros((N, N))
+
+    for i in prange(N):
+        for j in prange(i, N):
+            dr_init = cart_coords[i] - cart_coords[j]
+
+            for rnx in prange(-nx, nx + 1):
+                for rny in prange(-ny, ny + 1):
+                    for rnz in prange(-nz, nz + 1):
+                        lattice_translation = np.array([rnx, rny, rnz])
+                        shift = rnx * lattice_vectors[0] + rny * lattice_vectors[1] + rnz * lattice_vectors[2]
+
+                        if np.linalg.norm(shift) < R_max:
+                            dr = dr_init + shift
+
+                            if np.all(lattice_translation == 0):
+                                if i != j:
+                                    Ewald_real[i, j] += 0.5 / np.linalg.norm(dr) * math.erfc(np.linalg.norm(dr) / Sigma) * TO_EV
+                                else:
+                                    Ewald_recip_self[i, j] += -1 / Sigma / math.sqrt(np.pi) * TO_EV
+                            else:
+                                Ewald_real[i, j] += 0.5 / np.linalg.norm(dr) * math.erfc(np.linalg.norm(dr) / Sigma) * TO_EV
+
+                        gr = rnx * reciprocal_vectors[0] + rny * reciprocal_vectors[1] + rnz * reciprocal_vectors[2]
+                        if np.linalg.norm(gr) < G_max:
+                            if np.any(lattice_translation != 0):
+                                g_2 = np.dot(gr, gr)
+                                Ewald_recip[i, j] += TO_EV * (2 * np.pi / V) * math.exp(-0.25 * Sigma * Sigma * g_2) / g_2 * math.cos(np.dot(gr, dr_init))
+
+    Ewald_full = Ewald_real + Ewald_recip + Ewald_recip_self
+
+    for i in prange(N):
+        for j in prange(i):
+            Ewald_full[i, j] = Ewald_full[j, i]
+
+    return Ewald_full
+
+# Call the function
+def main_ewald_computation(frac_coords, lattice_vectors, sigma=None, R_max=None, G_max=None, max_shift=None, w=1, print_info=False, triu=False):
+    TO_EV = 14.39964390675221758120
+    
+    N = len(frac_coords)
+    V = np.linalg.det(lattice_vectors)
+    
+    reciprocal_vectors = 2 * np.pi * np.linalg.inv(lattice_vectors).T
+
+    # Calculate alpha if not provided
+    if sigma is None:
+        Sigma = ((N * w * np.pi**3) / V**2)**(-1/6)
+        
+    alpha = np.sqrt(1 / Sigma)
+    A = 1e-17
+    f = np.sqrt(-np.log(A))
+
+    # Calculate R_max and G_max
+    if R_max is None:
+        R_max = np.sqrt(-np.log(A) * Sigma**2)
+    
+    if G_max is None:
+        G_max = 2 / Sigma * np.sqrt(-np.log(A))
+
+    cart_coords = frac_coords @ lattice_vectors
+
+    # Precompute max lattice translation values outside Numba
+    if max_shift is None:
+        real_space_max = max_lattice_translation(lattice_vectors, R_max)
+        reci_space_max = max_lattice_translation(reciprocal_vectors, G_max)
+        real_reci_space_max = np.maximum(real_space_max, reci_space_max)
+        nx, ny, nz = real_reci_space_max
+    else:
+        nx = ny = nz = max_shift
+
+    # Call the Numba-optimized function
+    Ewald_full = compute_ewald_matrix_numba(frac_coords, cart_coords, reciprocal_vectors, sigma, R_max, G_max, nx, ny, nz, TO_EV, Sigma, alpha, V, N)
+
+    # Symmetrize the matrix
+    if triu:
+        Ewald_tmp = np.triu(Ewald_full) * 2
+        np.fill_diagonal(Ewald_tmp, Ewald_full.diagonal())
+        Ewald_full = np.copy(Ewald_tmp)
+
+    return Ewald_full
+
+
+def calculate_ewald_charges(ewald_matrix, charges):
+
+    """
+    Calculate the potential energy of the system given the Ewald summation matrix and charges.
+
+    Parameters:
+    ewald_matrix (ndarray): Ewald summation matrix (NxN).
+    charges (ndarray): Charges of the particles (N).
+
+    Returns:
+    float: Total potential energy of the system.
+    """
+    
+    charges = np.array(charges)
+    
+    
+    return  charges[:, np.newaxis] * charges[np.newaxis, :] * ewald_matrix
+
+# Numba-friendly Buckingham potential function
+@njit
+def buckingham_potential(buckingham_params, r):
+    A, rho, C = buckingham_params
+    return A * np.exp(-r / rho) - C / r**6
+
+# Numba-compiled function to compute the Buckingham matrix
+@njit(parallel=True)
+def compute_buckingham_matrix_numba(cart_coords, lattice_vectors, buckingham_matrix, buckingham_params_array, R_max, nx, ny, nz, N):
+    for i in prange(N):
+        for j in prange(i + 1, N):
+            dr_init = cart_coords[i] - cart_coords[j]
+
+            for rnx in prange(-nx, nx + 1):
+                for rny in prange(-ny, ny + 1):
+                    for rnz in prange(-nz, nz + 1):
+                        shift = rnx * lattice_vectors[0] + rny * lattice_vectors[1] + rnz * lattice_vectors[2]
+                        dr = dr_init + shift
+
+                        if np.linalg.norm(dr) < R_max:
+                            r = np.linalg.norm(dr)
+                            buckingham_matrix[i][j] += buckingham_potential(buckingham_params_array[i, j], r)
+
+# Main function that handles data preparation and non-Numba parts
+def compute_buckingham_matrix(structure, buckingham_dict, R_max, max_shift=None):
+    frac_coords = structure.frac_coords
+    lattice_vectors = structure.lattice.matrix
+    sites = structure.sites
+
+    N = structure.num_sites
+    cart_coords = frac_coords @ lattice_vectors
+    
+    if max_shift is None:
+        max_real = max_lattice_translation(lattice_vectors, R_max)
+        nx = max_real[0]
+        ny = max_real[1]
+        nz = max_real[2]
+    else:
+        ny = nz = nx = max_shift
+
+    buckingham_matrix = np.zeros((N, N))
+    
+    # Preprocess buckingham parameters into a 2D array for Numba
+    buckingham_params_array = np.zeros((N, N, 3))  # assuming 3 parameters: A, rho, and C
+    
+    for i in range(N):
+        for j in range(i + 1, N):
+            sites_label = f'{sites[i].specie}-{sites[j].specie}'
+            if sites_label in buckingham_dict:
+                buckingham_params_array[i, j] = buckingham_dict[sites_label]
+
+    # Call the Numba-compiled function to compute the matrix
+    compute_buckingham_matrix_numba(cart_coords, lattice_vectors, buckingham_matrix, buckingham_params_array, R_max, nx, ny, nz, N)
+    
+    return buckingham_matrix
