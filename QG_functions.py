@@ -329,6 +329,378 @@ def build_qubo_from_Ewald_IP(Ewald_matrix,IP_matrix):
     return Ewald_matrix + IP_matrix
 
 
+#### IP project new (discrete)
+
+## Ewald
+
+def expand_ewald_matrix(ewald_matrix, mn_indices):
+    """
+    Expands the given Ewald matrix by duplicating the Mn sites in mn_indices into 2x2 blocks.
+    
+    Parameters:
+        ewald_matrix (numpy.ndarray): Original N x N Ewald matrix.
+        mn_indices (list or numpy.ndarray): Indices of Mn sites that need to be expanded.
+
+    Returns:
+        numpy.ndarray: Expanded (2N_Mn + (N - N_Mn)) x (2N_Mn + (N - N_Mn)) Ewald matrix.
+    """
+
+    N = ewald_matrix.shape[0]  # Original matrix size
+    expanded_N = N + len(mn_indices)  # New matrix size after expansion
+
+    # Initialize expanded matrix
+    expanded_matrix = np.zeros((expanded_N, expanded_N))
+
+    row_offset = 0  # Tracks extra row shifts
+    col_offset = 0  # Tracks extra column shifts
+
+    for i in range(N):
+        if i in mn_indices:
+            # Expand Mn rows
+            col_offset = 0  # Reset column shift for each row
+            for j in range(N):
+                if j in mn_indices:
+                    # Expand Mn-Mn interaction into 2x2 block
+                    expanded_matrix[i + row_offset, j + col_offset] = ewald_matrix[i, j]  # (00)
+                    expanded_matrix[i + row_offset, j + col_offset + 1] = ewald_matrix[i, j]  # (01)
+                    expanded_matrix[i + row_offset + 1, j + col_offset] = ewald_matrix[i, j]  # (10)
+                    expanded_matrix[i + row_offset + 1, j + col_offset + 1] = ewald_matrix[i, j]  # (11)
+
+                    col_offset += 1  # Shift extra column
+                else:
+                    # Regular copy for non-Mn column
+                    expanded_matrix[i + row_offset, j + col_offset] = ewald_matrix[i, j]
+                    expanded_matrix[i + row_offset + 1, j + col_offset] = ewald_matrix[i, j]
+
+            row_offset += 1  # Shift extra row
+        else:
+            # Regular copy for non-Mn rows
+            col_offset = 0  # Reset column shift
+            for j in range(N):
+                if j in mn_indices:
+                    # Expand column only (without expanding row)
+                    expanded_matrix[i + row_offset, j + col_offset] = ewald_matrix[i, j]
+                    expanded_matrix[i + row_offset, j + col_offset + 1] = ewald_matrix[i, j]
+                    col_offset += 1
+                else:
+                    # Copy non-Mn element as is
+                    expanded_matrix[i + row_offset, j + col_offset] = ewald_matrix[i, j]
+
+    return expanded_matrix
+
+
+def build_charge_weighted_ewald(structure, expanded_ewald_matrix):
+    """
+    Builds the charge matrix (with Mn site doubling) and applies it to the expanded Ewald matrix.
+    
+    Parameters:
+    -----------
+    structure : ase.Atoms
+        The atomic structure (with Li, Mn, and O atoms).
+    expanded_ewald_matrix : np.ndarray
+        The Ewald matrix already expanded to (N + n_mn, N + n_mn).
+
+    Returns:
+    --------
+    weighted_ewald : np.ndarray
+        The Ewald matrix multiplied element-wise by the charge product matrix.
+    expanded_charges : np.ndarray
+        The charge vector with Mn site doubling logic applied.
+    """
+
+    atomic_numbers = np.array(structure.atomic_numbers)
+    num_sites = structure.num_sites
+
+
+    li_indices = np.where(atomic_numbers == 3)[0]
+    mn_indices = np.where(atomic_numbers == 25)[0]
+    o_indices  = np.where(atomic_numbers == 8)[0]
+
+    expanded_N = num_sites + len(mn_indices)
+    expanded_charges = np.zeros(expanded_N)
+    
+    row_offset = 0
+    for i in range(num_sites):
+        if i in mn_indices:
+            expanded_charges[i + row_offset]     = 4  # Mn₀
+            expanded_charges[i + row_offset + 1] = 3  # Mn₁
+            row_offset += 1
+        else:
+            expanded_charges[i + row_offset] = 1 if i in li_indices else -2  # Li = +1, O = -2
+
+    charge_matrix = expanded_charges[:, np.newaxis] * expanded_charges[np.newaxis, :]
+    weighted_ewald = expanded_ewald_matrix * charge_matrix
+
+    return weighted_ewald
+
+
+def project_and_remove_oxygen(weighted_ewald, structure, mn_indices, li_indices, o_indices):
+    """
+    Projects oxygen interactions into Li and Mn on-site terms,
+    removes oxygen atoms from the Ewald matrix, and returns total O–O interaction energy.
+
+    Returns:
+        final_ewald : np.ndarray
+        oo_energy : float
+    """
+    num_sites = structure.num_sites
+    expanded_size = weighted_ewald.shape[0]
+
+    index_map = {}
+    offset = 0
+    for i in range(num_sites):
+        if i in mn_indices:
+            index_map[i] = (i + offset, i + offset + 1)
+            offset += 1
+        else:
+            index_map[i] = (i + offset,)
+
+    updated_ewald = weighted_ewald.copy()
+
+    for i in range(num_sites):
+        if i in li_indices:
+            li_idx = index_map[i][0]
+            for o in o_indices:
+                o_idx = index_map[o][0]
+                updated_ewald[li_idx, li_idx] += weighted_ewald[li_idx, o_idx]
+        elif i in mn_indices:
+            mn0_idx, mn1_idx = index_map[i]
+            for o in o_indices:
+                o_idx = index_map[o][0]
+                updated_ewald[mn0_idx, mn0_idx] += weighted_ewald[mn0_idx, o_idx]
+                updated_ewald[mn1_idx, mn1_idx] += weighted_ewald[mn1_idx, o_idx]
+
+    # O–O energy
+    o_expanded_indices = [index_map[o][0] for o in o_indices]
+    oo_energy = weighted_ewald[np.ix_(o_expanded_indices, o_expanded_indices)].sum()
+
+    # Remove O
+    keep_mask = np.ones(expanded_size, dtype=bool)
+    keep_mask[o_expanded_indices] = False
+    final_ewald = updated_ewald[np.ix_(keep_mask, keep_mask)]
+
+    return final_ewald, oo_energy
+
+
+## Buckingham
+
+def expand_atomic_structure(atomic_numbers, coordinates, mn_indices):
+    """
+    Expands the atomic structure by duplicating Mn sites and assigning 'Tc' to the duplicated Mn.
+    
+    Parameters:
+        atomic_numbers (numpy.ndarray): Original atomic number array.
+        coordinates (numpy.ndarray): Original Nx3 atomic coordinates array.
+        mn_indices (list or numpy.ndarray): Indices of Mn sites in the original structure.
+
+    Returns:
+        expanded_atomic_numbers (numpy.ndarray): New atomic numbers array with Mn -> Mn/Tc duplication.
+        expanded_coordinates (numpy.ndarray): New coordinates array with Mn -> Mn/Tc duplication.
+    """
+
+    N = len(atomic_numbers)  # Original number of atoms
+    expanded_N = N + len(mn_indices)  # New size after duplicating Mn sites
+
+    # Initialize expanded arrays
+    expanded_atomic_numbers = np.zeros(expanded_N, dtype=int)
+    expanded_coordinates = np.zeros((expanded_N, 3))
+
+    row_offset = 0
+    for i in range(N):
+        if i in mn_indices:
+            # Duplicate Mn site: Even index = Mn, Odd index = Tc
+            expanded_atomic_numbers[i + row_offset] = atomic_numbers[i]  # Keep Mn
+            expanded_atomic_numbers[i + row_offset + 1] = 43  # Assign Tc (atomic number 43)
+
+            # Copy coordinates for both Mn and Tc
+            expanded_coordinates[i + row_offset] = coordinates[i]  # Mn coordinates
+            expanded_coordinates[i + row_offset + 1] = coordinates[i]  # Tc coordinates
+
+            row_offset += 1  # Shift for duplication
+        else:
+            # Copy other atomic sites as they are
+            expanded_atomic_numbers[i + row_offset] = atomic_numbers[i]
+            expanded_coordinates[i + row_offset] = coordinates[i]
+
+    return expanded_atomic_numbers, expanded_coordinates
+
+
+def project_and_remove_oxygen_from_buckingham(ip_matrix, atomic_numbers_expanded):
+    """
+    Projects O interactions into the diagonal of Li, Mn, and Tc,
+    then removes O atoms from the Buckingham matrix and returns total O–O contribution.
+
+    Returns:
+        ip_matrix_reduced : np.ndarray
+        oo_energy : float
+    """
+    expanded_N = len(atomic_numbers_expanded)
+
+    li_indices = np.where(atomic_numbers_expanded == 3)[0]
+    mn_indices = np.where(atomic_numbers_expanded == 25)[0]
+    tc_indices = np.where(atomic_numbers_expanded == 43)[0]
+    o_indices  = np.where(atomic_numbers_expanded == 8)[0]
+
+    updated_ip = ip_matrix.copy()
+
+    for idx in np.concatenate([li_indices, mn_indices, tc_indices]):
+        for o_idx in o_indices:
+            updated_ip[idx, idx] += ip_matrix[idx, o_idx]
+
+    # O–O energy
+    oo_energy = ip_matrix[np.ix_(o_indices, o_indices)].sum()
+
+    # Remove O
+    keep_mask = np.ones(expanded_N, dtype=bool)
+    keep_mask[o_indices] = False
+    ip_matrix_reduced = updated_ip[np.ix_(keep_mask, keep_mask)]
+
+    return ip_matrix_reduced, oo_energy
+
+## Total
+
+def build_qubo_limno_disc(structure, R_max_IP=25, sigma=None, R_max_Ewald=None, 
+                     G_max=None, max_shift = None,w=0.123,print_info=False, triu=False, 
+                         distance_analysis = False, distance_threshold = 0.1):
+    
+    # structure: pymatgen Structure than contains all the Li sites (and Mn and O)
+
+    # Build the initial Ewald matrix
+
+    ewald_matrix = compute_ewald_matrix(structure,sigma=sigma,max_shift = max_shift,
+                                    w=w,triu=triu, distance_analysis=distance_analysis,
+                                    distance_threshold=distance_threshold)
+    
+   
+    # Make the Ewald matrix discrete in the Mn positions
+    atomic_numbers = np.array(structure.atomic_numbers)
+    num_sites = structure.num_sites
+    frac_coordinates = structure.frac_coords  
+
+    li_indices = np.where(atomic_numbers == 3)[0]
+    mn_indices = np.where(atomic_numbers == 25)[0]
+    o_indices = np.where(atomic_numbers == 8)[0]
+
+    expanded_ewald_matrix = expand_ewald_matrix(ewald_matrix, mn_indices)
+
+    # Multiply by the charges (+4, +3, +1 and -2)
+    
+    weighted_ewald = build_charge_weighted_ewald(structure, expanded_ewald_matrix)
+
+    # Remove the oxygen, reduce the size of the matrix and get the O-O energy
+
+    final_ewald, oo_ewald_energy = project_and_remove_oxygen(
+        weighted_ewald, structure, mn_indices, li_indices, o_indices)
+    
+
+    # Expand atomic structure
+    expanded_atomic_numbers, expanded_coordinates = expand_atomic_structure(
+        atomic_numbers, frac_coordinates, mn_indices)
+
+
+    structure_new = Structure(structure.lattice,expanded_atomic_numbers,
+                              expanded_coordinates)
+
+    buckingham_dict = {'Li-O':[426.480 ,    0.3000  ,   0.00],
+                       'Mn-O':[3087.826    ,   0.2642 ,    0.00], # This is the Mn4+
+                       'Tc-O':[1686.125  ,    0.2962 ,    0.00], # This is the Mn3+
+                       'O-O' : [22.410  ,     0.6937,   32.32]
+                       }
+        
+    ip_matrix_expanded = compute_buckingham_matrix(structure_new, buckingham_dict, 25, 
+                                                max_shift=None, distance_analysis = False, 
+                                                distance_threshold = 0.1)
+
+    ip_matrix_expanded_reduced, oo_ip_energy = project_and_remove_oxygen_from_buckingham(
+                    ip_matrix_expanded, expanded_atomic_numbers)
+    
+    Q_matrix = final_ewald + ip_matrix_expanded_reduced
+    oo_energy = oo_ewald_energy + oo_ip_energy
+
+    return Q_matrix, oo_energy
+
+## Binary vectors
+
+def generate_binary_array(mn_indices, li_indices):
+    """
+    Generates a binary array where:
+    - The first len(mn_indices) * 2 positions are one-hot in couples (alternating 1,0 or 0,1).
+    - The next len(li_indices) positions are set to 1.
+
+    
+    Parameters:
+        mn_indices (list or numpy.ndarray): Indices of Mn sites.
+        li_indices (list or numpy.ndarray): Indices of Li sites.
+
+
+    Returns:
+        numpy.ndarray: Binary array following the specified pattern.
+    """
+
+    # Determine sizes
+    mn_count = len(mn_indices) * 2  # Each Mn site expands to two positions
+    li_count = len(li_indices)
+
+
+    # Initialize binary array with zeros
+    total_size = mn_count + li_count 
+    binary_array = np.zeros(total_size, dtype=int)
+
+    # Set Mn positions with alternating one-hot encoding
+    binary_array[:mn_count] = np.tile([1, 0], len(mn_indices))  # Alternates 1,0
+
+    # Set Li positions to 1
+    binary_array[mn_count:mn_count + li_count] = 1
+
+    # Set O positions to 1
+    binary_array[mn_count + li_count:] = 1
+
+    return binary_array
+
+
+def generate_random_binary_array(mn_indices, li_indices, n_active, seed=None):
+    """
+    Generates a binary array with Mn sites represented by [1,0] by default,
+    and [0,1] if activated. Li sites are randomly activated to 1.
+
+    Parameters:
+        mn_indices (list or np.ndarray): Indices of Mn atoms (before expansion).
+        li_indices (list or np.ndarray): Indices of Li atoms.
+        n_active (int): Number of Mn sites to activate (0,1) and Li sites to set to 1.
+        seed (int, optional): Seed for reproducibility.
+
+    Returns:
+        np.ndarray: Binary array of shape (2*len(mn_indices) + len(li_indices),).
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    n_mn = len(mn_indices)
+    n_li = len(li_indices)
+
+    assert n_active <= n_mn, f"n_active ({n_active}) cannot exceed number of Mn sites ({n_mn})"
+    assert n_active <= n_li, f"n_active ({n_active}) cannot exceed number of Li sites ({n_li})"
+
+    # Initialize with default: Mn = [1, 0], Li = 0
+    binary_array = np.zeros(2 * n_mn + n_li, dtype=int)
+    for i in range(n_mn):
+        binary_array[2 * i] = 1  # Mn inactive state = [1, 0]
+
+    # Activate n_active Mn blocks as [0, 1]
+    activated_mn = np.random.choice(n_mn, n_active, replace=False)
+    for i in activated_mn:
+        binary_array[2 * i] = 0
+        binary_array[2 * i + 1] = 1
+
+    # Activate n_active Li sites to 1
+    li_offset = 2 * n_mn
+    activated_li = np.random.choice(n_li, n_active, replace=False)
+    for i in activated_li:
+        binary_array[li_offset + i] = 1
+
+    return binary_array
+
+
 
 #### THINK ABOUT FUNCTIONS BELOW
 
