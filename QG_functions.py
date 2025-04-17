@@ -328,10 +328,314 @@ def build_qubo_from_Ewald_IP(Ewald_matrix,IP_matrix):
     
     return Ewald_matrix + IP_matrix
 
+def plot_matrix_heatmap(matrix, title="Matrix Heatmap", cmap="viridis", origin="upper", logscale=False):
+    plt.figure(figsize=(6, 6))
 
+    if logscale:
+        matrix = np.log10(np.abs(matrix) + 1e-12)
+
+    # Mask zero values
+    masked_matrix = np.ma.masked_where(matrix == 0, matrix)
+
+    # Use the chosen colormap but set color for masked (zero) entries to white
+    cmap_obj = plt.get_cmap(cmap)
+    cmap_obj.set_bad(color='white')  # or 'lightgray', if preferred
+
+    # Plot
+    im = plt.imshow(masked_matrix, cmap=cmap_obj, origin=origin)
+    plt.colorbar(im, label="Matrix Value")
+    plt.xlabel("Column Index")
+    plt.ylabel("Row Index")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
 #### IP project new (discrete)
 
 ## Ewald
+# USE THIS
+def max_lattice_translation_old(lattice_vectors, R_max):
+    # Calculate the maximum rnx, rny, and rnz
+    norm_0 = np.linalg.norm(lattice_vectors[0])
+    norm_1 = np.linalg.norm(lattice_vectors[1])
+    norm_2 = np.linalg.norm(lattice_vectors[2])
+    
+    max_rnx = int(R_max / norm_0)
+    max_rny = int(R_max / norm_1)
+    max_rnz = int(R_max / norm_2)
+    
+    max_rnx, max_rny, max_rnz = np.meshgrid(np.arange(-max_rnx, max_rnx+1),
+                                            np.arange(-max_rny, max_rny+1),
+                                            np.arange(-max_rnz, max_rnz+1),
+                                            indexing='ij')
+    
+    shifts = (max_rnx[..., np.newaxis] * lattice_vectors[0] + 
+              max_rny[..., np.newaxis] * lattice_vectors[1] + 
+              max_rnz[..., np.newaxis] * lattice_vectors[2])
+    
+    shift_norms = np.linalg.norm(shifts, axis=-1)
+    
+    valid_indices = np.where(shift_norms <= R_max)
+    
+    max_translation = np.array([max_rnx[valid_indices].max(),
+                                max_rny[valid_indices].max(),
+                                max_rnz[valid_indices].max()])
+    
+    return max_translation
+
+
+def compute_ewald_matrix(structure, sigma=None, R_max=None, G_max=None, 
+
+                         max_shift = None,charge=None,w=1,print_info=False, triu=False, 
+                         distance_analysis = False, distance_threshold = 0.1):
+    """
+    Parameters:
+    frac_coords (ndarray): Relative positions of particles (Nx3).
+    lattice_vectors (ndarray): Lattice vectors of the unit cell (3x3).
+    sigma (float): Ewald parameter controlling the split between real and reciprocal sums. If None, it's calculated.
+    max_shift (int): Depth of the real and reciprocal space summation.
+    reciprocal_depth (int): Depth of the reciprocal space summation.
+    charge (ndarray): charges of the system (Nx1).
+
+    Returns:
+    ndarray: Ewald summation matrix (NxN).
+    """
+    from numpy.linalg import norm
+    
+    TO_EV = 14.39964390675221758120
+    
+    t0 = time.time()
+    
+    frac_coords = structure.frac_coords
+    lattice_vectors = structure.lattice.matrix
+    distance_matrix = structure.distance_matrix
+
+    N = len(frac_coords)
+    V = np.linalg.det(lattice_vectors)
+    
+    reciprocal_vectors = 2 * np.pi * np.linalg.inv(lattice_vectors).T
+    
+    
+    # Calculate alpha if not provided
+    if sigma is None:
+        Sigma = ((N * w * np.pi**3) / V**2)**(-1/6)
+        
+    alpha = np.sqrt(1/Sigma)
+    
+
+    A = 1e-17 
+    f = np.sqrt(-np.log(A))
+
+    # Calculate R_max and G_max
+    if R_max == None:
+        R_max = f * np.sqrt(alpha)
+        R_max = np.sqrt(-np.log(A)*Sigma**2)
+    
+    if G_max == None:
+        G_max = 2 * f * np.sqrt(alpha)
+        G_max = 2/Sigma * np.sqrt(-np.log(A))
+
+    
+    
+    cart_coords = frac_coords @ lattice_vectors
+    
+    
+    if max_shift == None:
+        real_space_max = max_lattice_translation_old(lattice_vectors,R_max)
+        reci_space_max = max_lattice_translation_old(reciprocal_vectors,G_max)
+    
+        real_reci_space_max = np.maximum(real_space_max,reci_space_max)
+        
+        nx = real_reci_space_max[0]
+        ny = real_reci_space_max[1]
+        nz = real_reci_space_max[2]
+        # print(nx,ny,nz)
+    else:
+        nx = ny = nz = max_shift # To improve
+    
+    # Main computation
+    
+
+    
+    Real_E = Reci_E = 0.
+    
+    Ewald_real = np.zeros((N,N))
+    Ewald_recip = np.zeros((N,N))
+    Ewald_recip_self = np.zeros((N,N))
+    
+    if print_info == True:
+        print('reciprocal_vectors\n',reciprocal_vectors)
+
+        print(f'Volume = {V}')
+        print(f'w={w}')
+        
+        print(f'alpha= {alpha}, sigma={Sigma},R_max = {R_max}, G_max = {G_max}')
+        print(f'Charge = {charge}')
+        
+        #print('Cart coords\n',cart_coords)
+        print(f'Max vectors = {nx},{ny},{nz}')
+
+    for i in tqdm(range(N), desc="Computing real space"):
+        for j in range(i,N):
+            dr = cart_coords[i]-cart_coords[j]
+            dr_dm = distance_matrix[i][j]
+
+            if i != j and  distance_analysis == True and dr_dm < distance_threshold:
+                Ewald_real[i,j] = 1e6
+                print(i,j,np.linalg.norm(dr),dr_dm)
+            else:    
+                dr_init = cart_coords[i]-cart_coords[j]
+                dr_frac = frac_coords[i]-frac_coords[j]
+
+                for rnx in range(-nx, nx + 1):
+                    for rny in range(-ny, ny + 1):
+                        for rnz in range(-nz, nz + 1):
+
+                            lattice_translation = np.array([rnx, rny, rnz])
+
+                            shift = rnx*lattice_vectors[0]+rny*lattice_vectors[1]+rnz*lattice_vectors[2]
+                            if np.linalg.norm(shift) < R_max:
+                                dr = dr_init + shift
+
+                                if np.all(lattice_translation == 0):
+
+                                    if i != j:
+                                        Ewald_real[i,j] += 0.5 / norm(dr) * math.erfc(norm(dr)/Sigma) * TO_EV
+#                                         Real_E          += 0.5 * charge[i] * charge[j] / norm(dr) * math.erfc(norm(dr)/Sigma) * TO_EV
+                                    else:
+                                        Ewald_recip_self[i,j] += -1 / Sigma / math.sqrt(np.pi) * TO_EV
+
+
+                                else:
+
+                                    Ewald_real[i,j] += 0.5 / norm(dr) * math.erfc(norm(dr)/Sigma) * TO_EV
+#                                     Real_E          += 0.5 * charge[i] * charge[j] / norm(dr) * math.erfc(norm(dr)/Sigma) * TO_EV
+
+                                # Reciprocal sum
+
+                            gr = rnx*reciprocal_vectors[0]+rny*reciprocal_vectors[1]+rnz*reciprocal_vectors[2]
+                            if np.linalg.norm(gr) < G_max:
+
+                                if np.any(lattice_translation != 0):
+                                    g_2 = np.dot(gr, gr)
+
+#                                     Reci_E += TO_EV * (2 * np.pi / V) * (charge[i] * charge[j]) * math.exp(-0.25 * Sigma * Sigma * g_2) / g_2 * math.cos(np.dot(gr, dr))
+                                    Ewald_recip[i,j] +=  TO_EV * (2 * np.pi / V) * math.exp(-0.25 * Sigma * Sigma * g_2) / g_2 * math.cos(np.dot(gr, dr))
+
+    Ewald_full = Ewald_real+Ewald_recip+Ewald_recip_self
+    
+    for i in np.arange(N):
+        for j in np.arange(i):
+            Ewald_full[i, j] = Ewald_full[j, i]
+            
+    if triu == True:
+        Ewald_tmp = np.triu(Ewald_full)*2
+        np.fill_diagonal(Ewald_tmp,Ewald_full.diagonal())
+        Ewald_full = np.copy(Ewald_tmp)
+    
+#     Reci_self = sum(-(charge[i]**2) / Sigma / math.sqrt(np.pi) * TO_EV for i in range(N))
+    
+    if print_info == True:
+        
+        print(f"Real sum: {Real_E:.8f} eV")
+        print(f"Reciprocal sum: {Reci_E:.8f} eV")
+        print(f"Reciprocal self (eV): {Reci_self:.16f}")
+        print(f"Reciprocal (eV): {Reci_self + Reci_E:.16f}")
+        print(f"Total (eV): {Real_E + Reci_E + Reci_self:.16f}")
+    
+    return Ewald_full
+
+
+def calculate_potential_energy(ewald_matrix, charges):
+    """
+    Calculate the potential energy of the system given the Ewald summation matrix and charges.
+
+    Parameters:
+    ewald_matrix (ndarray): Ewald summation matrix (NxN).
+    charges (ndarray): Charges of the particles (N).
+
+    Returns:
+    float: Total potential energy of the system.
+    """
+    
+    charges = np.array(charges)
+    
+    
+    return  charges[:, np.newaxis] * charges[np.newaxis, :] * ewald_matrix
+
+
+def compute_discrete_ewald_matrix(structure, charge_options_by_Z, ewald_matrix=None):
+    """
+    Computes an expanded charge-weighted Ewald matrix for a pymatgen.Structure
+    using a dictionary of charge options by atomic number.
+
+    Parameters
+    ----------
+    structure : pymatgen.Structure
+        The atomic structure.
+    charge_options_by_Z : dict
+        Dictionary mapping atomic numbers (Z) to lists of possible charges.
+        Example: {26: [2, 3]} for Fe²⁺ and Fe³⁺.
+    ewald_matrix : np.ndarray, optional
+        Precomputed Ewald matrix. If None, will call compute_ewald_matrix(structure).
+
+    Returns
+    -------
+    weighted_ewald : np.ndarray
+        The Ewald matrix weighted by the outer product of the expanded charges.
+    expanded_charges : np.ndarray
+        1D array of charges including duplicated sites.
+    expanded_ewald_matrix : np.ndarray
+        Expanded Ewald matrix matching the length of `expanded_charges`.
+    """
+    if ewald_matrix is None:
+        ewald_matrix = compute_ewald_matrix(structure,triu=True)
+
+    num_sites = len(structure)
+    atomic_numbers = structure.atomic_numbers
+
+    total_new_sites = sum(
+        (len(charge_options_by_Z[Z]) - 1) * np.sum(np.array(atomic_numbers) == Z)
+        for Z in charge_options_by_Z
+        if Z in atomic_numbers
+    )
+
+    expanded_N = num_sites + total_new_sites
+    expanded_matrix = np.zeros((expanded_N, expanded_N))
+    expanded_charges = []
+    index_map = {}
+
+    new_idx = 0
+    for i, Z in enumerate(atomic_numbers):
+        if Z in charge_options_by_Z:
+            possible_charges = charge_options_by_Z[Z]
+            index_map[i] = list(range(new_idx, new_idx + len(possible_charges)))
+            expanded_charges.extend(possible_charges)
+            new_idx += len(possible_charges)
+        else:
+            # Default to site charge if it exists, else zero
+            try:
+                default_charge = structure[i].properties.get("charge", 0)
+            except AttributeError:
+                default_charge = 0
+            index_map[i] = [new_idx]
+            expanded_charges.append(default_charge)
+            new_idx += 1
+
+    expanded_charges = np.array(expanded_charges)
+
+    # Expand the Ewald matrix based on duplication map
+    for i in range(num_sites):
+        for j in range(num_sites):
+            for ii in index_map[i]:
+                for jj in index_map[j]:
+                    expanded_matrix[ii, jj] = ewald_matrix[i, j]
+
+    charge_matrix = np.outer(expanded_charges, expanded_charges)
+    weighted_ewald = expanded_matrix * charge_matrix
+
+    return weighted_ewald, expanded_charges, expanded_matrix
+
+
 
 def expand_ewald_matrix(ewald_matrix, mn_indices):
     """
@@ -483,6 +787,174 @@ def project_and_remove_oxygen(weighted_ewald, structure, mn_indices, li_indices,
 
 
 ## Buckingham
+#python
+def compute_buckingham_matrix(structure, buckingham_dict, R_max, max_shift=None, 
+                              distance_analysis = False, distance_threshold = 0.1):
+    """
+    Compute the Buckingham potential matrix for a system of particles.
+
+    Parameters:
+    positions (ndarray): Relative positions of particles (Nx3).
+    lattice_vectors (ndarray): Lattice vectors of the unit cell (3x3).
+
+    """
+    frac_coords = structure.frac_coords
+    lattice_vectors = structure.lattice.matrix
+    sites = structure.sites
+    distance_matrix = structure.distance_matrix
+    
+    TO_EV = 14.39964390675221758120
+    
+    t0 = time.time()
+    
+    N = structure.num_sites
+    V = np.linalg.det(lattice_vectors)
+    
+    cart_coords = frac_coords @ lattice_vectors
+    
+    if max_shift == None:
+        max_real = max_lattice_translation_old(lattice_vectors, R_max)
+        nx = max_real[0]
+        ny = max_real[1]
+        nz = max_real[2]
+    else:
+        ny = nz = nx = max_shift
+    #print(f'Max vectors = {nx},{ny},{nz}')
+    buckingham_matrix = np.zeros((N,N))
+    
+    for i in tqdm(range(N), desc="Buckingham matrix"):
+        for j in range(i+1,N):
+            
+            sites_label = f'{sites[i].specie}-{sites[j].specie}'
+            if sites_label in buckingham_dict:
+                dr_init = cart_coords[i]-cart_coords[j]
+                dr_dm = distance_matrix[i][j]
+                if i != j and distance_analysis == True and dr_dm < distance_threshold:
+                    buckingham_matrix[i,j] = 1e6
+                else:
+                    for rnx in range(-nx, nx + 1):
+                        for rny in range(-ny, ny + 1):
+                            for rnz in range(-nz, nz + 1):
+
+                                lattice_translation = np.array([rnx, rny, rnz])
+
+                                shift = rnx*lattice_vectors[0]+rny*lattice_vectors[1]+rnz*lattice_vectors[2]
+                                dr = dr_init + shift
+                                if np.linalg.norm(dr) < R_max:
+                                    dr = dr_init + shift
+    #                                 print(dr,np.linalg.norm(dr), buckingham_dict[sites_label],buckingham_potential(buckingham_dict[sites_label],
+    #                                                                          np.linalg.norm(dr)))
+                                    buckingham_matrix[i][j] += buckingham_potential(buckingham_dict[sites_label],
+                                                                         np.linalg.norm(dr))
+    return buckingham_matrix
+
+
+def compute_buckingham_matrix_discrete(structure, species_dict, buckingham_dict, R_max, max_shift=None,
+                                       distance_analysis=False, distance_threshold=0.1):
+    """
+    Compute an expanded Buckingham potential matrix for a system where certain chemical species
+    can exist as multiple elements (e.g., 'Ca' → ['Mg', 'Ca']).
+
+    Parameters
+    ----------
+    structure : pymatgen.Structure
+        The atomic structure.
+    species_dict : dict
+        Dictionary mapping species labels (str) to possible alternative elements.
+        Example: {'Ca': ['Mg', 'Ca']}.
+    buckingham_dict : dict
+        Dictionary of Buckingham parameters for each element pair (e.g., "Ca-F").
+    R_max : float
+        Maximum real space cutoff.
+    max_shift : int, optional
+        Maximum lattice vector translation in each direction.
+    distance_analysis : bool
+        If True, will flag very short distances.
+    distance_threshold : float
+        Threshold for flagging short distances.
+
+    Returns
+    -------
+    buckingham_matrix_expanded : np.ndarray
+        The expanded Buckingham interaction matrix.
+    expanded_species : list of str
+        Species labels corresponding to the rows/columns of the matrix.
+    """
+    import numpy as np
+    from pymatgen.core.periodic_table import Element
+    from tqdm import tqdm
+
+    def buckingham_potential(params, r):
+        A, rho, C = params
+        return A * np.exp(-r / rho) - C / r**6 if r != 0 else 0
+
+    frac_coords = structure.frac_coords
+    lattice_vectors = structure.lattice.matrix
+    cart_coords = frac_coords @ lattice_vectors
+    distance_matrix = structure.distance_matrix
+    sites = structure.sites
+
+    N = len(structure)
+    index_map = {}
+    expanded_species = []
+    new_idx = 0
+
+    # Step 1: Build index mapping and expanded species list
+    for i, site in enumerate(sites):
+        sp = str(site.specie)
+        if sp in species_dict:
+            options = species_dict[sp]
+            index_map[i] = list(range(new_idx, new_idx + len(options)))
+            expanded_species.extend(options)
+            new_idx += len(options)
+        else:
+            index_map[i] = [new_idx]
+            expanded_species.append(sp)
+            new_idx += 1
+
+    expanded_N = len(expanded_species)
+    buckingham_matrix_expanded = np.zeros((expanded_N, expanded_N))
+
+    # Step 2: Determine max lattice shift
+    if max_shift is None:
+        max_real = np.ceil(R_max / np.linalg.norm(lattice_vectors, axis=1)).astype(int)
+        nx, ny, nz = max_real
+    else:
+        nx = ny = nz = max_shift
+
+    # Step 3: Fill the expanded matrix
+    for i in tqdm(range(N), desc="Buckingham matrix"):
+        for j in range(i + 1, N):
+            sp_i = str(sites[i].specie)
+            sp_j = str(sites[j].specie)
+            options_i = species_dict.get(sp_i, [sp_i])
+            options_j = species_dict.get(sp_j, [sp_j])
+            dr_init = cart_coords[i] - cart_coords[j]
+            dr_dm = distance_matrix[i][j]
+
+            for ii, ei in zip(index_map[i], options_i):
+                for jj, ej in zip(index_map[j], options_j):
+                    pair_key1 = f"{ei}-{ej}"
+                    pair_key2 = f"{ej}-{ei}"
+                    key = pair_key1 if pair_key1 in buckingham_dict else pair_key2 if pair_key2 in buckingham_dict else None
+                    if not key:
+                        continue
+
+                    if distance_analysis and dr_dm < distance_threshold:
+                        buckingham_matrix_expanded[ii, jj] = 1e6
+                    else:
+                        for rnx in range(-nx, nx + 1):
+                            for rny in range(-ny, ny + 1):
+                                for rnz in range(-nz, nz + 1):
+                                    shift = rnx * lattice_vectors[0] + rny * lattice_vectors[1] + rnz * lattice_vectors[2]
+                                    dr = dr_init + shift
+                                    dist = np.linalg.norm(dr)
+                                    if dist < R_max:
+                                        V = buckingham_potential(buckingham_dict[key], dist)
+                                        buckingham_matrix_expanded[ii, jj] += V
+
+    return buckingham_matrix_expanded, expanded_species
+
 
 def expand_atomic_structure(atomic_numbers, coordinates, mn_indices):
     """
@@ -557,7 +1029,9 @@ def project_and_remove_oxygen_from_buckingham(ip_matrix, atomic_numbers_expanded
 
     return ip_matrix_reduced, oo_energy
 
+
 ## Total
+
 
 def build_qubo_limno_disc(structure, R_max_IP=25, sigma=None, R_max_Ewald=None, 
                      G_max=None, max_shift = None,w=0.123,print_info=False, triu=False, 
@@ -621,7 +1095,7 @@ def build_qubo_limno_disc(structure, R_max_IP=25, sigma=None, R_max_Ewald=None,
 
 ## Binary vectors
 
-def generate_binary_array(mn_indices, li_indices):
+def generate_binary_array(mn_indices, li_indices, one_hot = [1,0]):
     """
     Generates a binary array where:
     - The first len(mn_indices) * 2 positions are one-hot in couples (alternating 1,0 or 0,1).
@@ -647,7 +1121,7 @@ def generate_binary_array(mn_indices, li_indices):
     binary_array = np.zeros(total_size, dtype=int)
 
     # Set Mn positions with alternating one-hot encoding
-    binary_array[:mn_count] = np.tile([1, 0], len(mn_indices))  # Alternates 1,0
+    binary_array[:mn_count] = np.tile(one_hot, len(mn_indices))  # Alternates 1,0
 
     # Set Li positions to 1
     binary_array[mn_count:mn_count + li_count] = 1
